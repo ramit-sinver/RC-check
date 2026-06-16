@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+RC Prime Bulk Lookup - Carrum Mobility
+Reads a CSV of car numbers, hits GirnarCare RC-Prime API for each, writes result CSV.
+
+Usage:
+    python rc_lookup.py input.csv
+    python rc_lookup.py input.csv output.csv     # custom output name
+"""
+
+import sys
+import csv
+import time
+import requests
+from pathlib import Path
+from datetime import datetime
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+TOKEN   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyZW1haWwiOiJyYW1pdC5zaW52ZXJAY2FycnVtLmNvLmluIiwiaWF0IjoxNzc2NzQ3ODc0LCJleHAiOjE4MDgyODM4NzR9.bswW5nJAsXsMKE7XVmdaMkFO-nKwis9F7m4ts1vmZ8M"
+USER_ID = "69e705627d04d16b3fac2087"
+URL     = "https://rtoapi.girnarcare.com/bbuser/vehicle_registration_detail_prime"
+DELAY   = 0.5  # seconds between calls — don't hammer the API
+
+# ── Output columns ─────────────────────────────────────────────────────────────
+COLUMNS = [
+    "CAR NUMBER",
+    "MANUFACTURING YEAR",
+    "MANUFACTURING MONTH",
+    "DATE OF REGISTRATION",
+    "INSURANCE END DATE",
+    "TAX END DATE",
+    "FITNESS END DATE",
+    "STATUS",
+]
+
+# Prime response codes from the API docs
+PRIME_ERRORS = {
+    201: "Timeout",
+    202: "Unknown Error",
+    203: "Record Not Found",
+    204: "RC registered under multiple offices",
+    205: "Incomplete data returned",
+    400: "Bad Request",
+    401: "Authorization Required",
+    402: "Conflict",
+    403: "Access Forbidden",
+    404: "Unprocessable Entity",
+    500: "Internal Server Error",
+    501: "Bad Gateway",
+    502: "Service Unavailable",
+    503: "Gateway Timeout",
+}
+
+
+def empty_row(vehicle_number: str, reason: str) -> dict:
+    row = {col: "" for col in COLUMNS}
+    row["CAR NUMBER"] = vehicle_number
+    row["STATUS"]     = reason
+    return row
+
+
+def fetch_rc(vehicle_number: str) -> dict:
+    vnum = vehicle_number.strip().upper().replace(" ", "")
+    if not vnum:
+        return empty_row(vnum, "SKIPPED: empty value")
+
+    try:
+        resp = requests.post(
+            URL,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Bearer {TOKEN}",
+            },
+            data={"user_id": USER_ID, "vehicle_number": vnum},
+            timeout=15,
+        )
+        r = resp.json()
+    except requests.exceptions.Timeout:
+        return empty_row(vnum, "TIMEOUT")
+    except requests.exceptions.ConnectionError:
+        return empty_row(vnum, "CONNECTION ERROR")
+    except Exception as e:
+        return empty_row(vnum, f"ERROR: {e}")
+
+    # Outer API status
+    outer_code = resp.status_code
+    if outer_code == 422:
+        return empty_row(vnum, "BALANCE EXHAUSTED — top up at rtoadmin.girnarcare.com")
+    if outer_code == 400:
+        return empty_row(vnum, "TOKEN MISMATCH — check credentials")
+    if outer_code == 404:
+        return empty_row(vnum, "PLAN / USER NOT FOUND")
+
+    # Prime-layer status (the real result)
+    prime_code = r.get("prime_response_code")
+    if not r.get("status") or prime_code != 200:
+        reason = PRIME_ERRORS.get(prime_code, r.get("prime_response_msg", "Unknown"))
+        return empty_row(vnum, f"API [{prime_code}]: {reason}")
+
+    # Parse the data array into a flat dict
+    kv = {item["name"]: (item["value"] or "") for item in r.get("data", [])}
+
+    # Manufacturing Year comes as "M/YYYY" (e.g. "5/2019")
+    mfg_raw = kv.get("Manufacturing Year", "")
+    if "/" in mfg_raw:
+        mfg_month, mfg_year = mfg_raw.split("/", 1)
+    else:
+        mfg_month = ""
+        mfg_year  = mfg_raw
+
+    return {
+        "CAR NUMBER":           vnum,
+        "MANUFACTURING YEAR":   mfg_year.strip(),
+        "MANUFACTURING MONTH":  mfg_month.strip(),
+        "DATE OF REGISTRATION": kv.get("Registration Date", ""),
+        "INSURANCE END DATE":   kv.get("Insurance upto", ""),
+        "TAX END DATE":         kv.get("RC tax upto", ""),
+        "FITNESS END DATE":     kv.get("Fitness upto", ""),
+        "STATUS":               "SUCCESS",
+    }
+
+
+def looks_like_vehicle_number(value: str) -> bool:
+    """
+    Indian vehicle numbers: 2 letters + 2 digits + optional letters + digits
+    e.g. KA01AB1234, MH02CD5678, DL01E0001, RJ45CJ2398
+    """
+    import re
+    pattern = r"^[A-Z]{2}\d{2}[A-Z]{0,3}\d{1,4}$"
+    return bool(re.match(pattern, value.strip().upper().replace(" ", "")))
+
+
+def read_car_numbers(csv_path: str) -> list[str]:
+    """
+    Handles:
+     - CSV with or without a header row (auto-detects by checking if first row
+       looks like a real vehicle number; if not, skips it as a header)
+     - Car number in the first column (any header name)
+     - Trims whitespace and skips blank lines
+    """
+    numbers = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        rows = [r for r in reader if r and r[0].strip()]
+
+    if not rows:
+        return []
+
+    # If first row doesn't look like a vehicle number, it's a header — skip it
+    start = 0 if looks_like_vehicle_number(rows[0][0]) else 1
+
+    for row in rows[start:]:
+        val = row[0].strip()
+        if val:
+            numbers.append(val)
+
+    return numbers
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python rc_lookup.py input.csv [output.csv]")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    if not Path(input_path).exists():
+        print(f"File not found: {input_path}")
+        sys.exit(1)
+
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = sys.argv[2] if len(sys.argv) > 2 else f"rc_output_{timestamp}.csv"
+
+    car_numbers = read_car_numbers(input_path)
+    total       = len(car_numbers)
+
+    if total == 0:
+        print("No car numbers found in the file.")
+        sys.exit(1)
+
+    print(f"\n{'─'*50}")
+    print(f"  RC Prime Bulk Lookup — Carrum Mobility")
+    print(f"{'─'*50}")
+    print(f"  Input  : {input_path}")
+    print(f"  Output : {output_path}")
+    print(f"  Total  : {total} vehicles")
+    print(f"{'─'*50}\n")
+
+    results = []
+    success_count = 0
+
+    for i, vnum in enumerate(car_numbers, 1):
+        print(f"[{i:>4}/{total}]  {vnum:<15} ... ", end="", flush=True)
+        row = fetch_rc(vnum)
+        results.append(row)
+
+        status = row["STATUS"]
+        if status == "SUCCESS":
+            success_count += 1
+            print(f"OK  |  {row['MANUFACTURING YEAR']}  |  Insured till {row['INSURANCE END DATE']}")
+        else:
+            print(f"FAIL  |  {status}")
+
+        if i < total:
+            time.sleep(DELAY)
+
+    # Write output CSV
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"\n{'─'*50}")
+    print(f"  Done: {success_count}/{total} successful")
+    print(f"  Saved to: {output_path}")
+    print(f"{'─'*50}\n")
+
+
+if __name__ == "__main__":
+    main()
